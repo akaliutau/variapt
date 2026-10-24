@@ -1,12 +1,11 @@
 # variapt
 
 A compact PoC using Mubit to synthesize geometric initialization recipes for
-unchanged [Sparrow](https://github.com/JeroenGar/sparrow). The model proposes
+frozen nesting optimization core [Sparrow](https://github.com/JeroenGar/sparrow). The model proposes
 relationships between original parts; exact geometry and native construction
 check them. All timed optimization runs on independent original parts.
 
-Project code is written during the event. Open-source libraries and existing
-tooling may be reused. **Every project LLM call goes through Mubit.**
+**Every project LLM call goes through Mubit.**
 
 ## Run
 

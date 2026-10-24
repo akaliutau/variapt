@@ -1,0 +1,34 @@
+[
+  {
+    "name": "inspect_patterns",
+    "arguments": {
+      "layout_id": "baseline",
+      "patterns": [
+        {
+          "source_instances": [
+            "3:3",
+            "3:13"
+          ],
+          "members": [],
+          "hypothesis": "Explicit mock: compile the observed opposed comb pair with accessible cavities retained.",
+          "evidence": [
+            "The original-part contours are used; no convex envelope replaces them."
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "finish",
+    "arguments": {
+      "patterns": [
+        {
+          "candidate_id": "pattern_0",
+          "copies": 7
+        }
+      ],
+      "summary": "Explicit mock formulation and expansion check.",
+      "limitations": "Not a model decision or an optimization claim."
+    }
+  }
+]

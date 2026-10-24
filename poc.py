@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Compact Sparrow PoC: solve, sample pairs, solve grouped, or execute one Mubit choice."""
+"""Compact Sparrow PoC: native solves and a Mubit geometric-analysis loop."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,15 +11,14 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-import uuid
 
-from geometry import check_layout, draw_comparison, draw_layout, draw_pairs, expand_pairs, group_job, layout_metrics, pair_candidates, polygon
+from geometry import (check_layout, draw_comparison, draw_layout, draw_pairs, expand_pairs,
+                      group_job, layout_metrics, layout_snapshot, original_solution,
+                      pair_candidates, polygon, inspect_pattern, placed)
+from planner import analyse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SPARROW = ROOT / ".cache/sparrow-target/release/sparrow"
-MUBIT_URL = "https://api.mubit.ai/openai/v1/chat/completions"
 
 
 class DeadlineExceeded(TimeoutError):
@@ -36,6 +36,11 @@ def expire(signum, frame):
     raise DeadlineExceeded("Episode deadline reached")
 
 
+def search_remaining(args):
+    budget = getattr(args, "search_budget", None)
+    return budget["limit_seconds"] - budget["allocated_seconds"] if budget is not None else args.seconds
+
+
 def save(path, data):
     Path(path).write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
@@ -51,10 +56,36 @@ def load_job(path):
     return job
 
 
+def job_signature(job):
+    original = {key:value for key,value in job.items() if key != "solution"}
+    return hashlib.sha256(json.dumps(original,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+
+
+def recipe_payload(job, patterns, selection, provenance):
+    items = {item["id"]:item for item in job["items"]}
+    proposals = []
+    for entry in selection:
+        pattern = patterns[entry["candidate_id"]]
+        members = []
+        for member in pattern["members"]:
+            pose = member["transformation"]
+            bounds = placed(polygon(items[member["item_id"]]["shape"]),pose).bounds
+            members.append({"item_id":member["item_id"],"rotation":pose["rotation"],
+                "lower_left":list(bounds[:2]),"reflected":pose.get("reflected",False)})
+        proposals.append({"copies":entry["copies"],"specification":{"source_instances":[],
+            "members":members,"hypothesis":pattern["hypothesis"],"evidence":pattern["evidence"]}})
+    return {"version":1,"source_job_sha256":job_signature(job),"provenance":provenance,"patterns":proposals}
+
+
 def solve(job, out, args):
     available = remaining(args, reserve=0.5)
-    seconds = min(args.seconds, int(available - 0.25)) if hasattr(args, "deadline") else args.seconds
-    if seconds < 1:
+    construct = getattr(args,"construct_only",False)
+    seconds = 0 if construct else min(args.seconds,int(available-0.25)) if hasattr(args,"deadline") else args.seconds
+    if getattr(args, "search_budget", None) is not None and not construct:
+        seconds = min(seconds, search_remaining(args))
+        if search_remaining(args) < 1:
+            raise ValueError("The episode's native search allowance is exhausted")
+    if seconds < 1 and not construct:
         raise DeadlineExceeded("Not enough episode budget for a one-second solve and export")
     binary = args.sparrow.resolve()
     if not binary.is_file():
@@ -65,10 +96,12 @@ def solve(job, out, args):
                "--rng-seed", str(args.seed), "--workers", str(args.workers)]
     started = time.monotonic()
     record = {"job": job["name"], "seed": args.seed, "workers": args.workers,
-              "search_seconds": seconds, "command": command}
+              "search_seconds": seconds, "construction_only":construct, "command": command}
     try:
         with (out / "solver.log").open("w") as log:
             timeout = remaining(args, reserve=0.5) if hasattr(args, "deadline") else seconds + 5
+            if getattr(args, "search_budget", None) is not None:
+                args.search_budget["allocated_seconds"] += seconds
             subprocess.run(command, cwd=out, check=True, timeout=timeout,
                            env={**os.environ, "RAYON_NUM_THREADS": str(args.workers)},
                            stdout=log, stderr=subprocess.STDOUT)
@@ -190,267 +223,273 @@ def group(args):
     return record
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def choose(observation, out, args):
-    """One call, exclusively through Mubit; mock mode never loads credentials."""
-    started = time.monotonic()
-    trace = {"mode": "mock" if args.mock_action else "mubit", "status": "pending", "request_id": None}
-    try:
-        remaining(args)
-        if args.mock_action:
-            action = {"action": "pair" if args.mock_action.startswith("pair_") else args.mock_action,
-                      "candidate_id": args.mock_action if args.mock_action.startswith("pair_") else None,
-                      "reason": "Explicit mock choice for a local smoke run."}
-        else:
-            from dotenv import load_dotenv
-            load_dotenv(ROOT / ".env", override=False)
-            secret = os.environ.get("MUBIT_API_KEY")
-            if not secret:
-                raise ValueError("Set MUBIT_API_KEY in the environment or .env")
-            schema = {"type": "object", "additionalProperties": False,
-                      "properties": {"action": {"type": "string", "enum": sorted({c["action"] for c in observation["choices"]})},
-                                     "candidate_id": {"type": ["string", "null"],
-                                                      "enum": [None] + [c["id"] for c in observation["candidates"]]},
-                                     "reason": {"type": "string"}},
-                      "required": ["action", "candidate_id", "reason"]}
-            payload = {"model": args.model or os.environ.get("MUBIT_MODEL", "gpt-6-luna"),
-                       "max_completion_tokens": 1024,
-                       "messages": [{"role": "system", "content": (
-                           "Choose one advertised nesting action to reduce original-part strip length. "
-                           "plain restarts on original parts; pair solves envelopes then refines released original parts when time permits; "
-                           "refine warm-starts the current original-part layout and releases all pairs. "
-                           "Compare whole_job_lower_bound, area_inflation_fraction, required_utilization_to_beat "
-                           "and length_at_baseline_utilization against the current whole-job result. "
-                           "The lower bound applies to the grouped seed, not its released refinement, and is not a prediction. "
-                           "Large inflation makes a pair costly. "
-                           "paired_length_estimate covers only a subset: never compare it to the whole-job length. "
-                           "Use only advertised IDs. Set candidate_id to null unless action is pair. "
-                           "Return the requested JSON with a brief reason; do not invent coordinates.")},
-                           {"role": "user", "content": "Nesting episode: " + uuid.uuid4().hex},
-                           {"role": "user", "content": json.dumps(observation, allow_nan=False)}],
-                       "response_format": {"type": "json_schema", "json_schema": {
-                           "name": "nesting_choice", "strict": True, "schema": schema}}}
-            trace.update(endpoint=MUBIT_URL, request=payload)
-            save(out / "decision.json", trace)
-            request = urllib.request.Request(MUBIT_URL, data=json.dumps(payload).encode(),
-                                             headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"})
-            trace["timeout_seconds"] = min(args.model_timeout, remaining(args, reserve=1.5))
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=trace["timeout_seconds"]) as response:
-                trace["request_id"] = response.headers.get("x-middleware-request-id")
-                trace["response"] = json.load(response)
-            if not trace["request_id"]:
-                raise ValueError("Mubit response omitted x-middleware-request-id")
-            action = json.loads(trace["response"]["choices"][0]["message"]["content"])
-        if not isinstance(action, dict) or set(action) != {"action", "candidate_id", "reason"}:
-            raise ValueError("Decision must contain action, candidate_id and reason")
-        if not isinstance(action["reason"], str) or not action["reason"].strip():
-            raise ValueError("Decision reason must be a nonempty string")
-        if {"action": action["action"], "candidate_id": action["candidate_id"]} not in observation["choices"]:
-            raise ValueError("Decision is not an advertised action/candidate combination")
-        remaining(args)
-        trace.update(status="completed", action=action)
-        return action, trace
-    except DeadlineExceeded as error:
-        trace.update(status="budget_exhausted", error=str(error))
-        raise
-    except Exception as error:
-        if isinstance(error, urllib.error.HTTPError):
-            trace["request_id"] = error.headers.get("x-middleware-request-id")
-        trace.update(status="failed", error=str(error))
-        raise ValueError(f"Mubit decision failed; see {out / 'decision.json'}: {error}") from None
-    finally:
-        trace["elapsed_seconds"] = round(time.monotonic() - started, 3)
-        save(out / "decision.json", trace)
-
-
 def write_demo(job, baseline, incumbent, out, record, args):
     remaining(args)
     result, metrics, source, _ = incumbent
     before = json.loads(Path(baseline["solution"]).read_text())
-    choice = record["action"]
-    choice_label = f"pair({choice['candidate_id']})" if choice["candidate_id"] else choice["action"]
-    chooser = "Mock" if record["mode"] == "mock" else "Mubit"
-    selected = str(source.relative_to(out))
-    action_path = Path(record["action_result"]["solution"]).relative_to(out)
-    action_link = action_path.with_name("layout.png") if record["action_result"].get("image") else action_path
-    final_link = "layout.png" if (source / "layout.png").is_file() else "solution.json"
     reduction = 1 - metrics["strip_length"] / baseline["strip_length"]
-    caption = (f"{chooser} choice: {choice_label}. {choice['reason']} "
-               f"Retained: {selected}. Length reduction: {reduction:.2%}. Request: {record['request_id'] or 'mock'}.")
+    planner = record.get("planner", {})
+    calls = sum(turn.get("mode") == "mubit" for turn in planner.get("turns", []))
+    caption = f"Model: {planner.get('model', 'compiled recipe')}; {calls} current Mubit calls. Native selection: {record.get('native_selection', 'unknown')}. Measured initializer gain: {record.get('construction_improvement', 0):.3f}. Final native length: {metrics['strip_length']:.3f}."
     draw_comparison(job, before, result, out / "comparison.png", caption)
-    provenance_path = args.input.with_suffix(".source.json")
-    provenance = json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
-    concave = [i["id"] for i in job["items"] if polygon(i["shape"]).convex_hull.area > polygon(i["shape"]).area * 1.000001]
-    lines = [f"# {job['name']} nesting demo", "", f"{metrics['part_count']} original parts, {len(job['items'])} types; non-convex types: {concave}.",
-             f"Total budget: {args.budget_seconds:g}s; search cap per solve: {args.seconds}s; workers: {args.workers}; seed: {args.seed}.", "",
-             "| Layout | Executed length | Original-area utilization |", "| --- | ---: | ---: |"]
-    rows = [("Stock baseline", baseline)]
-    if "grouped_result" in record:
-        rows.append(("Grouped seed", record["grouped_result"]))
-        if "refinement_result" in record:
-            rows.append(("Released-part refinement", record["refinement_result"]))
-    else:
-        rows.append(("Chosen action", record["action_result"]))
-    for label, data in [*rows, ("Retained result", metrics)]:
-        lines.append(f"| {label} | {data['strip_length']:.6f} | {data['utilization']:.2%} |")
-    lines += ["", f"Measured retained length reduction: **{reduction:.2%}**. Selected: **{selected}**.",
-              f"{chooser} choice: **{choice_label}**. {choice['reason']}",
-              f"Request ID: `{record['request_id'] or 'mock; no model request'}`.", "",
-              "Original inventory, legal orientations, bounds, overlap and clearance checks passed.",
-              f"Native clearance: {job.get('min_item_separation', 0):g}; physical units are those of the input dataset.", "",
-              "![Original-part before/after layouts](comparison.png)", "",
-              f"[Executed action]({action_link}) · [Final layout]({final_link}) · [Decision trace](decision.json) · [Episode metrics](episode.json)", ""]
-    if (out / "pairs.png").is_file():
-        lines += ["## Offered pair candidates", "", "![Pair candidates](pairs.png)", ""]
-    if provenance:
-        lines += ["## Input source", "", provenance["description"],
-                  f"[Pinned benchmark input]({provenance['source_url']}) · [Authors' paper]({provenance['paper_url']})",
-                  f"Input SHA256: `{provenance['sha256']}`. {provenance['modifications']}", ""]
+    lines = [f"# {job['name']} geometric investigation", "",
+             f"{metrics['part_count']} original parts; {args.budget_seconds:g}s wall budget; {args.workers} solver workers.",
+             f"Native search allowance: {args.seconds}s total; allocated: {args.search_budget['allocated_seconds']}s including the initial probe.",
+             f"Model: {planner.get('model')}; reasoning: {args.reasoning_effort}; full context: {planner.get('context_characters', 0)} characters.", "",
+             "| Executed layout | Search seconds | Length | Original-area utilization |", "| --- | ---: | ---: | ---: |",
+             f"| Initial stock probe | {baseline['search_seconds']} | {baseline['strip_length']:.6f} | {baseline['utilization']:.2%} |"]
+    for trial in record["trials"]:
+        lines.append(f"| {trial['layout_id']}: {trial['operation']} | {trial['search_seconds']} | {trial['strip_length']:.6f} | {trial['utilization']:.2%} |")
+    lines += [f"| Retained best | — | {metrics['strip_length']:.6f} | {metrics['utilization']:.2%} |", "",
+              f"Accepted recipe's initializer improvement: **{record.get('construction_improvement', 0):.6f}** length units.",
+              f"Native selection: **{record.get('native_selection', 'unknown')}**. All accepted layouts passed original-part checks.",
+              f"Total change from construction to final layout: {reduction:.2%}, including ordinary native optimization. This is not a measurement of model advantage.", "",
+              "[Model hypotheses, tool measurements and conclusions](planner/analysis.md) · [Full context](planner/context.json) · [Episode](episode.json)", "",
+              "![Original-part comparison](comparison.png)", ""]
+    if record.get("analysis_summary"):
+        lines += ["Model recipe before native execution:", record["analysis_summary"], record.get("analysis_limitations", ""), ""]
+    if record.get("native_fallback"):
+        lines += [f"Model investigation failed; native fallback used the checked seed: {record['planner_error']}", ""]
+    if record["mode"] == "recipe":
+        lines += ["This run loaded a compiled recipe with no new LLM calls. It was checked against the stock initializer; an unhelpful recipe falls back to stock. Original model cost and IDs are in episode.json recipe_provenance.", ""]
+        lines = [line for line in lines if "planner/analysis.md" not in line]
+    if (out/"recipe.json").is_file():
+        lines += ["[Geometrically checked reusable recipe](recipe.json)", ""]
     (out / "demo.md").write_text("\n".join(lines))
     remaining(args)
-    record.update(report=str(out / "demo.md"), comparison=str(out / "comparison.png"),
-                  length_reduction_fraction=reduction, provenance=provenance)
+    record.update(report=str(out / "demo.md"), comparison=str(out / "comparison.png"), length_reduction_fraction=reduction)
 
 
 def episode(args):
     started = time.monotonic()
     args.deadline = started + args.budget_seconds
+    args.search_budget = {"limit_seconds": args.seconds, "allocated_seconds": 0}
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     record = {"status": "completed", "budget_seconds": args.budget_seconds, "baseline_length": None,
-              "selected_result": None, "solution": None, "image": None, "candidate_status": "not_run",
-              "mode": "mock" if args.mock_action else "mubit", "decision_count": 0}
-    incumbent, exports, phase = None, [], "baseline"
+              "solution": None, "image": None,
+              "mode": "recipe" if getattr(args,"recipe",None) else "mock" if args.mock_plan else "mubit",
+              "trials": [], "pattern_measurements": []}
+    incumbent, search_seed, layouts, snapshots, patterns = None, None, {}, {}, {}
+    mappings = []
+    attempt = 0
+    phase = "baseline"
 
-    def promote(result, details, source):
+    def promote(result, details, source, layout_id):
         nonlocal incumbent
         remaining(args)
-        checked = (result, details, source, time.monotonic() - started)
-        exports.append(checked)
+        checked = (result, details, source, time.monotonic()-started)
+        layouts[layout_id] = checked
         if incumbent is None or result["solution"]["strip_width"] < incumbent[0]["solution"]["strip_width"]:
             incumbent = checked
+        return checked
+
+    def selected(layout_id):
+        if layout_id == "best":
+            return incumbent
+        if layout_id not in layouts:
+            raise ValueError(f"Unknown layout {layout_id}; available: best, {', '.join(layouts)}")
+        return layouts[layout_id]
+
+    def snapshot(layout_id):
+        checked = selected(layout_id)
+        key = str(checked[2])
+        if key not in snapshots:
+            snapshots[key] = layout_snapshot(job, checked[0])
+        return snapshots[key]
+
+    def publish(result, details, target, operation, hypothesis):
+        finish(job, result, target, details, args)
+        previous = incumbent[0]["solution"]["strip_width"]
+        checked = promote(result, details, target, target.name)
+        entry = {"layout_id": target.name, "operation": operation, "hypothesis": hypothesis,
+                 **{k: details[k] for k in ["strip_length", "utilization", "search_seconds", "elapsed_seconds"]},
+                 "accepted_as_best": incumbent is checked, "solution": details["solution"]}
+        record["trials"].append(entry)
+        feedback = {**entry, "improvement_over_previous_best": max(0, previous-details["strip_length"])}
+        return feedback
+
+    def observe():
+        nonlocal phase
+        phase = "planner"
+        return {"remaining_seconds": remaining(args),
+                "analysis_remaining_seconds": max(0, remaining(args)-search_remaining(args)-5),
+                "search_budget": {**args.search_budget, "remaining_seconds": search_remaining(args)},
+                "available_layouts": [{"id": key, **layout_metrics(job, value[0])} for key, value in layouts.items()],
+                "best_layout_id": next(key for key, value in layouts.items() if value is incumbent),
+                "completed_trials": record["trials"],
+                "measured_patterns": [{k:p[k] for k in ["id","max_copies","envelope_fill","area_inflation_at_max_copies","closed_hole_area"]} for p in patterns.values()]}
+
+    def execute(name, arguments):
+        nonlocal phase, mappings, attempt, search_seed
+        phase = name
+        if name == "inspect_patterns":
+            specifications = arguments["patterns"]
+            if not 1 <= len(specifications) <= 3:
+                raise ValueError("Inspect one to three patterns per batch")
+            source = selected(arguments["layout_id"])[0]
+            measurements = []
+            for specification in specifications:
+                try:
+                    key = f"pattern_{len(patterns)}"
+                    candidate = inspect_pattern(job, source, specification, key)
+                    candidate.update(hypothesis=specification["hypothesis"],evidence=specification["evidence"])
+                    patterns[key] = candidate
+                    measurements.append(candidate)
+                except (ValueError, KeyError, TypeError) as error:
+                    measurements.append({"hypothesis":specification.get("hypothesis"),"error":str(error)})
+            save(out / "patterns.json", patterns)
+            record["pattern_measurements"].extend([{k:v for k,v in p.items() if k not in ["envelope","members"]} for p in measurements])
+            return {"measured":measurements,"native_search_seconds":0}
+        if name == "finish":
+            recipe = arguments["patterns"]
+            if len(recipe) > 3 or len({p["candidate_id"] for p in recipe}) != len(recipe):
+                raise ValueError("Select at most three distinct measured patterns")
+            formulation, pending = original, []
+            for entry in recipe:
+                if entry["candidate_id"] not in patterns:
+                    raise ValueError("Use measured pattern IDs")
+                formulation, mapping = group_job(formulation,patterns[entry["candidate_id"]],entry["copies"])
+                pending.append(mapping)
+            if pending:
+                attempt += 1
+                target = out / "trials" / f"trial_{attempt}"
+                seed_args = argparse.Namespace(**{**vars(args),"seed":args.seed,"construct_only":True})
+                result, details = solve(formulation,target,seed_args)
+                save(target / "mappings.json",pending)
+                for mapping in pending:
+                    result = expand_pairs(job,result,mapping)
+                feedback = publish(result,details,target,"pattern_construction","Evaluate the full original-part initializer with zero optimizer search.")
+                gain = baseline["strip_length"]-details["strip_length"]
+                record.setdefault("recipe_trials",[]).append({"recipe":recipe,"construction_improvement":gain,"layout_id":target.name})
+                if gain <= max(1e-3,baseline["strip_length"]*1e-5):
+                    return {"error":"Recipe did not improve the complete stock initializer. Change its relations/counts or finish with an empty recipe.",
+                        "baseline_length":baseline["strip_length"],"construction_improvement":gain,**feedback,
+                        "snapshot":snapshot(target.name),"native_search_spent":0}
+                search_seed = layouts[target.name]
+                record["construction_improvement"] = gain
+            mappings = pending
+            record.update(pattern_recipe=recipe,analysis_summary=arguments["summary"],analysis_limitations=arguments["limitations"])
+            return {"finished":True,"groups":mappings,"native_search_reserved":search_remaining(args)}
+        raise ValueError(f"Unknown tool: {name}")
 
     previous_handler = signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, max(0.001, args.deadline - time.monotonic()))
+    signal.setitimer(signal.ITIMER_REAL, max(.001, args.deadline-time.monotonic()))
     try:
-        remaining(args)
         job = load_job(args.input)
-        save(out / "input.json", job)
         original = {k: v for k, v in job.items() if k != "solution"}
-        best, baseline = solve(job, out / "baseline", args)
+        save(out / "input.json", job)
+        if "solution" in job:
+            (out / "baseline").mkdir()
+            save(out / "baseline/input.json", job)
+            best = original_solution(job, job)
+            baseline = {"status": "provided", "search_seconds": 0, "elapsed_seconds": 0}
+        else:
+            initial = argparse.Namespace(**{**vars(args), "seconds": args.initial_seconds,
+                "construct_only":args.initial_seconds==0})
+            best, baseline = solve(job, out / "baseline", initial)
         finish(job, best, out / "baseline", baseline, args)
         record["baseline_length"] = baseline["strip_length"]
-        promote(best, baseline, out / "baseline")
-        phase = "pairs"
-        try:
-            candidate_set = write_pairs(job, out, args, baseline["strip_length"], preview=False)
-        except ValueError as error:
-            candidate_set = {"candidates": [], "sampling_note": str(error)}
-            save(out / "pairs.json", candidate_set)
-        candidates = candidate_set["candidates"]
-        observation = {"job": job["name"], "strip_height": job["strip_height"],
-                       "clearance": job.get("min_item_separation", 0),
-                       "inventory": [{"id": i["id"], "demand": i["demand"], "area": polygon(i["shape"]).area,
-                                      "hull_area_ratio": polygon(i["shape"]).convex_hull.area / polygon(i["shape"]).area} for i in job["items"]],
-                       "current": {k: baseline[k] for k in ["strip_length", "utilization", "part_count"]},
-                       "original_job_area": baseline["original_area"],
-                       "paired_area_fraction": candidate_set.get("paired_area_fraction", 0),
-                       "pairs_available": candidate_set.get("pairs_available", 0),
-                       "pair_item_id": candidate_set.get("item_id"),
-                       "leftover_count": candidate_set.get("leftover_count", 0),
-                       "remaining_seconds": round(remaining(args), 3), "search_seconds_cap": args.seconds,
-                       "candidates": [{k: c[k] for k in ["id", "width", "height", "envelope_fill", "rows_in_strip",
-                           "paired_length_estimate", "whole_job_area", "whole_job_lower_bound", "area_inflation_fraction",
-                           "required_utilization_to_beat", "length_at_baseline_utilization"]} for c in candidates],
-                       "choices": [{"action": "plain", "candidate_id": None}, {"action": "refine", "candidate_id": None}]
-                                  + [{"action": "pair", "candidate_id": c["id"]} for c in candidates]}
-        save(out / "observation.json", observation)
-        phase = "decision"
-        record["decision_count"] = 1
-        action, trace = choose(observation, out, args)
-        remaining(args)
-        record.update(action=action, request_id=trace["request_id"], candidate_status="pending")
-        action_args = argparse.Namespace(**{**vars(args), "seed": args.seed + 1, "refine": False})
-        phase = "action"
-        if action["action"] == "pair":
-            candidate = next(c for c in candidates if c["id"] == action["candidate_id"])
-            seed_args = argparse.Namespace(**{**vars(action_args),
-                "seconds": min(args.seconds, max(1, int(remaining(args) - 1.5) // 2))})
-            result, action_record = grouped_solve(original, candidate, out / "action", seed_args)
-        else:
-            result, action_record = solve(best if action["action"] == "refine" else original, out / "action", action_args)
-            finish(job, result, out / "action", action_record, action_args)
-        record["action_result"] = action_record
-        promote(result, action_record, out / "action")
-        record["candidate_status"] = "accepted" if incumbent[2].name != "baseline" else "not_shorter"
-        if action["action"] == "pair":
-            record["grouped_result"] = action_record
-            record["refinement_status"] = "skipped"
-            if remaining(args) >= 1.75:
-                phase = "refinement"
-                record["refinement_status"] = "pending"
-                refined, refinement = solve(result, out / "refine", action_args)
-                finish(job, refined, out / "refine", refinement, action_args)
-                record.update(refinement_status="completed", refinement_result=refinement)
-                promote(refined, refinement, out / "refine")
-                if refinement["strip_length"] < action_record["strip_length"]:
-                    record["action_result"] = refinement
-                record["candidate_status"] = "accepted" if incumbent[2].name != "baseline" else "not_shorter"
+        search_seed = promote(best, baseline, out / "baseline", "baseline")
+        phase = "context"
+        render_layout(job, best, out / "baseline", baseline, args)
+        types = []
+        for item in original["items"]:
+            shape = polygon(item["shape"])
+            void = shape.convex_hull.difference(shape)
+            pieces = list(void.geoms) if hasattr(void, "geoms") else [void]
+            types.append({"id": item["id"], "area": shape.area, "perimeter": shape.length,
+                          "bounds": list(shape.bounds), "hull_area": shape.convex_hull.area,
+                          "analysis_outline": {"approximate": True,
+                              "vertices": list(shape.simplify(max(shape.bounds[2]-shape.bounds[0],shape.bounds[3]-shape.bounds[1])*.005,preserve_topology=True).exterior.coords)},
+                          "hull_voids": [{"area": p.area, "bounds": list(p.bounds),
+                              "analysis_vertices": list(p.simplify(max(1,shape.length)*.0005,preserve_topology=True).exterior.coords) if p.geom_type=="Polygon" else []}
+                              for p in sorted(pieces, key=lambda p: p.area, reverse=True)[:3] if not p.is_empty]})
+        context = {"task": "Reduce the length used by all original parts. Investigate geometric structure with exact tools.",
+                   "full_original_job": original, "type_measurements": types, "initial_layout": snapshot("baseline"),
+                   "initial_solver_log": (out/"baseline/solver.log").read_text() if (out/"baseline/solver.log").is_file() else "Checked input solution; native search reserved for the final refinement.",
+                   "constraints": "All pose changes must be executed and checked on original geometry and inventory.",
+                   "budget_seconds": args.budget_seconds, "model_turn_limit": args.planner_turns,
+                   "search_budget_seconds": args.seconds,
+                   "final_native_search_seconds": search_remaining(args), "workers": args.workers}
+        phase = "planner"
+        if getattr(args,"recipe",None):
+            artifact = json.loads(args.recipe.read_text())
+            if artifact.get("version") != 1 or artifact.get("source_job_sha256") != job_signature(job):
+                raise ValueError("Recipe belongs to a different original job; recompile it for this input")
+            if artifact.get("evaluation",{}).get("status") == "rejected":
+                record["recipe_rejected"] = "Prior end-to-end comparison favoured stock; compiled candidate bypassed."
+                record["recipe_evaluation"] = artifact["evaluation"]
             else:
-                record["refinement_skip_reason"] = "Not enough budget for a one-second refinement and export"
+                proposals = artifact["patterns"]
+                execute("inspect_patterns",{"layout_id":"baseline","patterns":[p["specification"] for p in proposals]})
+                if len(patterns) != len(proposals):
+                    raise ValueError("Stored recipe failed geometric revalidation; see patterns.json")
+                checked_recipe = execute("finish",{"patterns":[{"candidate_id":f"pattern_{i}","copies":p["copies"]} for i,p in enumerate(proposals)],
+                    "summary":"Replay the geometrically revalidated compiled recipe; no new model calls.",
+                    "limitations":"Compilation cost is excluded from this replay and recorded in recipe provenance."})
+                if "error" in checked_recipe:
+                    record["recipe_rejected"] = checked_recipe["error"]
+            record["recipe_provenance"] = artifact["provenance"]
+            record["planner"] = {"status":"recipe_replay","model":artifact["provenance"].get("model"),
+                "context_characters":0,"turns":[]}
+        else:
+            try:
+                record["planner"] = analyse(context, observe, execute, out / "planner", args,
+                    lambda: max(0, remaining(args)-search_remaining(args)-5), out/"baseline/layout.png")
+            except DeadlineExceeded:
+                raise
+            except Exception as error:
+                record.update(planner_error=str(error), native_fallback=True)
+        if mappings:
+            provenance = record.get("recipe_provenance",{"mode":record["mode"],"model":record.get("planner",{}).get("model"),
+                "model_seconds":sum(t.get("model_seconds",0) for t in record.get("planner",{}).get("turns",[])),
+                "mubit_request_ids":[t["request_id"] for t in record.get("planner",{}).get("turns",[]) if t.get("request_id")]})
+            save(out / "recipe.json",recipe_payload(job,patterns,record["pattern_recipe"],provenance))
+        record["refinement_seed"] = str(search_seed[2].relative_to(out))
+        record["model_contribution"] = "initializer_improved" if mappings else "none"
+        if search_remaining(args) >= 1:
+            phase = "native_refinement"
+            attempt += 1
+            target = out / "trials" / f"trial_{attempt}"
+            polish_args = argparse.Namespace(**{**vars(args),"seed":args.seed})
+            native_input = search_seed[0] if mappings or "solution" in job else original
+            record["native_selection"] = "compiled_seed" if mappings else "provided_seed" if "solution" in job else "stock"
+            result, details = solve(native_input, target, polish_args)
+            result = original_solution(job, result)
+            publish(result, details, target, "native_refinement", "One continuous original-part solve from the selected checked structural seed.")
         phase = "plots"
-        rendered = set()
-        for result, details, source, _ in [incumbent, *exports]:
-            if source not in rendered:
+        for result, details, source, _ in [incumbent, *layouts.values()]:
+            if not (source/"layout.png").is_file():
                 render_layout(job, result, source, details, args)
-                rendered.add(source)
-        if candidates:
-            remaining(args)
-            draw_pairs(job, candidate_set, out / "pairs.png")
-            remaining(args)
-        if getattr(args, "command", "episode") == "demo":
+        if args.command == "demo":
             phase = "report"
             write_demo(job, baseline, incumbent, out, record, args)
     except DeadlineExceeded as error:
         record.update(status="budget_exhausted", error=str(error), stopped_during=phase)
-        if phase == "refinement":
-            record["refinement_status"] = "late"
-        if record["candidate_status"] == "pending":
-            record["candidate_status"] = "late"
     except Exception as error:
         record.update(status="failed", error=str(error), stopped_during=phase)
-        if phase == "refinement":
-            record["refinement_status"] = "failed"
-        if record["candidate_status"] == "pending":
-            record["candidate_status"] = "rejected"
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
-    # Copy only an immutable, checked export. Missing presentation never loses a solution.
+    if (out/"planner/planner.json").is_file():
+        record["planner"] = json.loads((out/"planner/planner.json").read_text())
     if incumbent is not None:
-        best, metrics, source, accepted = incumbent
+        best, details, source, accepted = incumbent
         for name in ["solution.json", "validation.json"]:
-            shutil.copyfile(source / name, out / name)
-        if (source / "layout.png").is_file():
-            shutil.copyfile(source / "layout.png", out / "layout.png")
-            record["image"] = str(out / "layout.png")
-        record.update({k: metrics[k] for k in ["strip_length", "utilization", "original_area", "part_count", "validation"]})
-        record.update(selected_result="baseline" if source.name == "baseline" else "action",
+            shutil.copyfile(source/name, out/name)
+        if (source/"layout.png").is_file():
+            shutil.copyfile(source/"layout.png", out/"layout.png")
+            record["image"] = str(out/"layout.png")
+        record.update({key: details[key] for key in ["strip_length", "utilization", "original_area", "part_count"]},
+                      validation=details["validation"], solution=str(out/"solution.json"),
                       selected_phase=str(source.relative_to(out)), accepted_elapsed_seconds=round(accepted, 3),
-                      solution=str(out / "solution.json"), improvement=record["baseline_length"] - best["solution"]["strip_width"])
-        if source.name != "baseline":
-            record["candidate_status"] = "accepted"
-        if metrics.get("plot_error"):
-            record["plot_error"] = metrics["plot_error"]
-    elapsed = time.monotonic() - started
-    record.update(elapsed_seconds=round(elapsed, 3), deadline_reached=elapsed >= args.budget_seconds,
-                  budget_overrun_seconds=round(max(0, elapsed - args.budget_seconds), 3))
-    save(out / "run.json", record)
-    save(out / "episode.json", record)
+                      improvement=record["baseline_length"]-best["solution"]["strip_width"])
+    elapsed = time.monotonic()-started
+    record.update(elapsed_seconds=round(elapsed, 3), budget_overrun_seconds=round(max(0, elapsed-args.budget_seconds), 3),
+                  search_budget={**args.search_budget, "remaining_seconds": search_remaining(args)})
+    save(out/"episode.json", record)
+    save(out/"run.json", record)
     return record
 
 
@@ -461,11 +500,13 @@ def main():
         sub = commands.add_parser(name)
         sub.add_argument("input", type=Path, **({"nargs": "?", "default": ROOT / "examples/gardeyn4.json"} if name == "demo" else {}))
         sub.add_argument("--out", type=Path, required=True)
-        if name != "run":
+        if name in ["pairs", "group"]:
             sub.add_argument("--item", type=int, help="Repeated part ID; otherwise prefer a concave type")
             sub.add_argument("--keep", type=int, choices=range(1, 13), default=4)
         if name != "pairs":
-            sub.add_argument("--seconds", type=int, default=5 if name == "demo" else 3, help="Search seconds per solve, plus startup/export overhead")
+            analyst = name in ["episode", "demo"]
+            sub.add_argument("--seconds", type=int, default=30 if analyst else 3,
+                             help="Total native search seconds across the initial probe and all trials" if analyst else "Search seconds per solve, plus startup/export overhead")
             sub.add_argument("--seed", type=int, default=42)
             sub.add_argument("--workers", type=int, choices=range(1, 5), default=2)
             sub.add_argument("--sparrow", type=Path, default=Path(os.environ.get("SPARROW_BIN") or DEFAULT_SPARROW))
@@ -473,15 +514,26 @@ def main():
             sub.add_argument("--candidate", default="pair_0")
             sub.add_argument("--refine", action="store_true", help="Warm-start Sparrow on the expanded original parts")
         if name in ["episode", "demo"]:
-            sub.add_argument("--budget-seconds", type=float, default=30, help="Total episode budget, including model, solver, geometry and plots")
-            sub.add_argument("--mock-action", help="plain, refine or pair_N; omit for one live Mubit call")
-            sub.add_argument("--model", help="Mubit model; defaults to MUBIT_MODEL or gpt-6-luna")
-            sub.add_argument("--model-timeout", type=int, choices=range(1, 61), default=20)
+            sub.add_argument("--initial-seconds", type=int, default=0, help="Initial search time; zero constructs a baseline without optimization")
+            sub.add_argument("--budget-seconds", type=float, default=120, help="Shared model, solver, geometry and plotting budget")
+            sub.add_argument("--mock-plan", type=Path, help="Explicit local tool sequence; no model calls or credentials")
+            sub.add_argument("--recipe",type=Path,help="Replay a compiled recipe without model calls; all geometry is revalidated")
+            sub.add_argument("--model", help="Mubit model; defaults to MUBIT_MODEL or gpt-6.1-sol")
+            sub.add_argument("--reasoning-effort", choices=["low", "medium", "high"], default="medium")
+            sub.add_argument("--planner-turns", type=int, choices=range(1, 9), default=3)
+            sub.add_argument("--max-output-tokens", type=int, default=8192)
+            sub.add_argument("--model-timeout", type=int, choices=range(1, 61), default=60)
     args = parser.parse_args()
     if args.command != "pairs" and not 1 <= args.seconds <= 3600:
         parser.error("--seconds must be between 1 and 3600")
     if args.command in ["episode", "demo"] and not 0 < args.budget_seconds <= 3600:
         parser.error("--budget-seconds must be greater than zero and at most 3600")
+    if args.command in ["episode", "demo"] and not 0 <= args.initial_seconds <= 3600:
+        parser.error("--initial-seconds must be between 0 and 3600")
+    if args.command in ["episode","demo"] and args.recipe and args.mock_plan:
+        parser.error("Choose --recipe or --mock-plan")
+    if args.command in ["episode", "demo"] and not 1024 <= args.max_output_tokens <= 16384:
+        parser.error("--max-output-tokens must be between 1024 and 16384")
     result = {"run": run, "pairs": pairs, "group": group, "episode": episode, "demo": episode}[args.command](args)
     print(json.dumps(result, indent=2))
     if result.get("status") in ["failed", "budget_exhausted"]:

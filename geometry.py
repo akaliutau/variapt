@@ -1,11 +1,12 @@
-"""Small geometry helpers: native Sparrow polygons, pair sampling and pictures."""
+"""Native polygons, measured motifs, pose expansion, validation and pictures."""
 import math
 from collections import Counter
 from copy import deepcopy
 from itertools import combinations
 
 from shapely import affinity
-from shapely.geometry import Polygon, box
+from shapely.geometry import LineString, Polygon, box
+from shapely.ops import nearest_points, unary_union
 
 
 def polygon(shape):
@@ -136,20 +137,27 @@ def pair_candidates(job, item_id=None, keep=4, incumbent_length=None):
             "sampled_angles": angles, "contacts_tried": tried, "pruned_by_area_bound": pruned, "candidates": candidates}
 
 
-def group_job(job, candidate):
-    """Replace copies by conservative pair envelopes; retain every unpaired part."""
+def group_job(job, candidate, copies=None):
+    """Repeat a rigid motif, including different part types, without changing inventory."""
     grouped = deepcopy({k: v for k, v in job.items() if k != "solution"})
-    target = candidate["members"][0]["item_id"]
-    source = next(i for i in grouped["items"] if i["id"] == target)
-    count, leftover = divmod(source["demand"], 2)
+    needed = Counter(m["item_id"] for m in candidate["members"])
+    demands = {i["id"]: i["demand"] for i in job["items"]}
+    maximum = min(demands[key] // quantity for key, quantity in needed.items())
+    count = maximum if copies is None else copies
+    if type(count) is not int or not 1 <= count <= maximum:
+        raise ValueError(f"Motif copies must be between 1 and {maximum}")
     group_id = max(i["id"] for i in grouped["items"]) + 1
-    source["demand"] = leftover
+    for item in grouped["items"]:
+        item["demand"] -= count * needed[item["id"]]
     grouped["items"] = [i for i in grouped["items"] if i["demand"]]
     grouped["items"].append({"id": group_id, "demand": count,
                              "shape": deepcopy(candidate["envelope"]),
                              "orientation": deepcopy(candidate["orientation"])})
     mapping = {"candidate_id": candidate["id"], "group_item_id": group_id,
-               "groups": count, "leftover_count": leftover, "members": candidate["members"]}
+               "groups": count, "leftover_counts": {key: demands[key] - count * n for key, n in needed.items()},
+               "members": candidate["members"]}
+    if len(needed) == 1:
+        mapping["leftover_count"] = next(iter(mapping["leftover_counts"].values()))
     return grouped, mapping
 
 
@@ -172,6 +180,7 @@ def expand_pairs(job, result, mapping):
             x, y = local["translation"]
             placements.append({"item_id": member["item_id"], "transformation": {
                 "rotation": (world["rotation"] + local["rotation"]) % 360,
+                "reflected": local.get("reflected", False),
                 "translation": [world["translation"][0] + c*x - s*y,
                                 world["translation"][1] + s*x + c*y]}})
     solution = expanded["solution"]
@@ -180,6 +189,141 @@ def expand_pairs(job, result, mapping):
     density = area / (solution["strip_width"] * job["strip_height"])
     solution["density"] = solution["layout"]["density"] = density
     return expanded
+
+
+def original_solution(job, result):
+    """Restore the original job header and original-part density."""
+    restored = deepcopy({k: v for k, v in job.items() if k != "solution"})
+    restored["solution"] = deepcopy(result["solution"])
+    area = sum(polygon(i["shape"]).area * i["demand"] for i in job["items"])
+    density = area / (restored["solution"]["strip_width"] * job["strip_height"])
+    restored["solution"]["density"] = restored["solution"]["layout"]["density"] = density
+    return restored
+
+
+def instances(result):
+    counts = Counter()
+    found = {}
+    for placement in result["solution"]["layout"]["placed_items"]:
+        key = placement["item_id"]
+        counts[key] += 1
+        found[f"{key}:{counts[key]}"] = placement
+    return found
+
+
+def legal_pose(item, pose, turn=0):
+    axes = item["orientation"].get("reflection_axes", []) if pose.get("reflected", False) else [0]
+    return any(legal_angle(item, pose["rotation"] + turn - 2*a) for a in axes)
+
+
+def inspect_pattern(job, result, specification, candidate_id):
+    """Compile an observed or newly synthesized relation into a contour-preserving part."""
+    items = {i["id"]: i for i in job["items"]}
+    source, proposed = specification["source_instances"], specification["members"]
+    if bool(source) == bool(proposed):
+        raise ValueError("Use either source_instances or explicit members, with the other empty")
+    if source:
+        found = instances(result)
+        if len(set(source)) != len(source) or any(key not in found for key in source):
+            raise ValueError("Use distinct instance IDs from the named layout")
+        members = deepcopy([found[key] for key in source])
+    else:
+        members = []
+        for p in proposed:
+            lower = p["lower_left"]
+            if type(p["item_id"]) is not int or p["item_id"] not in items or len(lower) != 2 or not all(type(v) in [int,float] and math.isfinite(v) for v in lower):
+                raise ValueError("Use known original types and finite lower-left anchors")
+            if type(p["rotation"]) not in [int,float] or not math.isfinite(p["rotation"]) or type(p["reflected"]) is not bool:
+                raise ValueError("Use a finite rotation and a boolean reflection flag")
+            pose = {"rotation":p["rotation"],"translation":[0,0],"reflected":p["reflected"]}
+            x0,y0,_,_ = placed(polygon(items[p["item_id"]]["shape"]),pose).bounds
+            pose["translation"] = [lower[0]-x0,lower[1]-y0]
+            members.append({"item_id":p["item_id"],"transformation":pose})
+    if not 2 <= len(members) <= 6:
+        raise ValueError("A pattern needs two to six original parts")
+    needed = Counter(m["item_id"] for m in members)
+    if any(key not in items or count > items[key]["demand"] for key,count in needed.items()):
+        raise ValueError("Pattern exceeds original inventory")
+    for m in members:
+        pose = m["transformation"]
+        if len(pose["translation"]) != 2 or not all(type(v) in [int,float] and math.isfinite(v) for v in [pose["rotation"],*pose["translation"]]):
+            raise ValueError("Pattern poses must contain finite original-coordinate rotations/translations")
+        if not legal_pose(items[m["item_id"]], pose):
+            raise ValueError("Pattern uses a forbidden orientation or reflection")
+    shapes = [placed(polygon(items[m["item_id"]]["shape"]),m["transformation"]) for m in members]
+    clearance = job.get("min_item_separation",0)
+    for a,b in combinations(shapes,2):
+        tolerance = 1e-6 if source else 1e-8
+        linear = min(max(a.bounds[2]-a.bounds[0],a.bounds[3]-a.bounds[1]),
+                     max(b.bounds[2]-b.bounds[0],b.bounds[3]-b.bounds[1]))*2e-6 if source else 1e-7
+        if a.intersection(b).area > min(a.area,b.area)*tolerance or a.distance(b)+linear < clearance:
+            raise ValueError("Pattern members overlap or violate clearance")
+    union = unary_union(shapes)
+    epsilon = max(1, union.bounds[2]-union.bounds[0], union.bounds[3]-union.bounds[1])*2e-5
+    connected = union
+    bridge_length = 0
+    # Sparrow items are simple polygons. Join disconnected members by thin bridges,
+    # retaining every accessible cavity instead of replacing the union with its hull.
+    while connected.geom_type == "MultiPolygon":
+        pieces = list(connected.geoms)
+        a,b = min(combinations(pieces,2),key=lambda pair:pair[0].distance(pair[1]))
+        bridge_length += a.distance(b)
+        connected = unary_union([connected,LineString(nearest_points(a,b)).buffer(epsilon)])
+    if connected.geom_type != "Polygon" or not connected.is_valid:
+        raise ValueError("Pattern cannot form a valid connected outline")
+    outline = Polygon(connected.exterior)
+    original_area = sum(shape.area for shape in shapes)
+    if union.difference(outline).area > original_area*1e-9:
+        raise ValueError("Pattern outline does not conservatively contain its originals")
+    x0,y0,x1,y1 = outline.bounds
+    for m in members:
+        pose = m["transformation"]
+        pose["translation"] = [pose["translation"][0]-x0,pose["translation"][1]-y0]
+    discrete = next((m for m in members if items[m["item_id"]]["orientation"]["rotation"]["mode"] != "continuous"),None)
+    rotation = {"mode":"continuous"}
+    if discrete is not None:
+        item,pose = items[discrete["item_id"]],discrete["transformation"]
+        axes = item["orientation"].get("reflection_axes",[]) if pose.get("reflected",False) else [0]
+        turns = {0.0,*((r+2*a-pose["rotation"])%360 for r in sampled_angles(item) for a in axes)}
+        rotation = {"mode":"discrete","angles":sorted(t for t in turns if all(legal_pose(items[m["item_id"]],m["transformation"],t) for m in members))}
+    maximum = min(items[key]["demand"]//quantity for key,quantity in needed.items())
+    whole_area = sum(polygon(i["shape"]).area*i["demand"] for i in job["items"])
+    return {"id":candidate_id,"source_instances":source,"members":members,
+        "envelope":{"type":"simple_polygon","data":list(affinity.translate(outline,-x0,-y0).exterior.coords)[:-1]},
+        "orientation":{"rotation":rotation},"width":x1-x0,"height":y1-y0,
+        "envelope_fill":original_area/outline.area,"max_copies":maximum,
+        "area_inflation_at_max_copies":maximum*(outline.area-original_area)/whole_area,
+        "convex_hull_area":union.convex_hull.area,"outline_area":outline.area,"original_area":original_area,
+        "convex_hull_fill":original_area/union.convex_hull.area,
+        "bbox_fill":original_area/((x1-x0)*(y1-y0)),"bridge_length":bridge_length,
+        "closed_hole_area":outline.area-connected.area,
+        "note":"Accessible concavities are retained. Closed holes are filled because native items cannot contain holes."}
+
+
+def layout_snapshot(job, result):
+    """Exact poses plus measured neighbourhoods and strip occupancy for model analysis."""
+    items = {i["id"]: i for i in job["items"]}
+    found = instances(result)
+    shapes = {key: placed(polygon(items[p["item_id"]]["shape"]), p["transformation"]) for key, p in found.items()}
+    neighbours = {key: [] for key in found}
+    for a, b in combinations(found, 2):
+        distance = shapes[a].distance(shapes[b])
+        ax0, ay0, ax1, ay1 = shapes[a].bounds
+        bx0, by0, bx1, by1 = shapes[b].bounds
+        overlap = max(0, min(ax1,bx1)-max(ax0,bx0)) * max(0, min(ay1,by1)-max(ay0,by0))
+        neighbours[a].append({"id": b, "distance": distance, "bbox_overlap_area": overlap})
+        neighbours[b].append({"id": a, "distance": distance, "bbox_overlap_area": overlap})
+    length, height = result["solution"]["strip_width"], job["strip_height"]
+    sections = []
+    for index in range(16):
+        left, right = length*index/16, length*(index+1)/16
+        stripe = box(left, 0, right, height)
+        sections.append({"x_range": [left, right], "fill": sum(s.intersection(stripe).area for s in shapes.values()) / stripe.area})
+    return {"metrics": layout_metrics(job, result),
+            "instances": [{"id": key, **p, "bounds": list(shapes[key].bounds),
+                           "neighbours": sorted(neighbours[key], key=lambda n: n["distance"])[:6]} for key, p in found.items()],
+            "rightmost_instances": sorted(found, key=lambda key: shapes[key].bounds[2], reverse=True)[:10],
+            "strip_sections": sections}
 
 
 def check_layout(job, result):
@@ -201,8 +345,7 @@ def check_layout(job, result):
         item, pose = items[p["item_id"]], p["transformation"]
         if not all(math.isfinite(v) for v in [pose["rotation"], *pose["translation"]]):
             raise ValueError("Nonfinite placement")
-        axes = item["orientation"].get("reflection_axes", []) if pose.get("reflected", False) else [0]
-        if not any(legal_angle(item, pose["rotation"] - 2*a) for a in axes):
+        if not legal_pose(item, pose):
             raise ValueError(f"Forbidden orientation for part {item['id']}")
         original = polygon(item["shape"])
         bx0, by0, bx1, by1 = original.bounds

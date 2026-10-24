@@ -1,0 +1,47 @@
+{
+  "name": "repeated",
+  "units": "mm",
+  "strip_height": 22.0,
+  "min_item_separation": 0.05,
+  "items": [
+    {
+      "id": 0,
+      "demand": 8,
+      "orientation": {
+        "rotation": {
+          "mode": "stepped",
+          "step": 90
+        }
+      },
+      "shape": {
+        "type": "simple_polygon",
+        "data": [
+          [
+            0,
+            0
+          ],
+          [
+            10,
+            0
+          ],
+          [
+            10,
+            4
+          ],
+          [
+            4,
+            4
+          ],
+          [
+            4,
+            10
+          ],
+          [
+            0,
+            10
+          ]
+        ]
+      }
+    }
+  ]
+}

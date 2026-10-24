@@ -1,0 +1,15 @@
+{
+  "dataset": "GARDEYN4",
+  "description": "Full real-world nesting benchmark derived from AlmaCAM metalworking and shipbuilding shapes.",
+  "source_url": "https://github.com/JeroenGar/sparrow/blob/1fe3e3146110c34d77510636defb737c7ce893c6/data/input/gardeyn4.json",
+  "paper_url": "https://arxiv.org/html/2509.13329v2#S12",
+  "revision": "1fe3e3146110c34d77510636defb737c7ce893c6",
+  "sha256": "bdb7f8505bbc2a92fdffaa0f8eb734d5dfdf02e7b4a8e81519cb28a808f0ab61",
+  "license_file": "Sparrow-LICENSE.txt",
+  "modifications": "None: original coordinates, demands, strip height and orientations are retained.",
+  "part_count": 80,
+  "part_types": 5,
+  "nonconvex_types": 5,
+  "clearance": 0,
+  "units": "unspecified benchmark units"
+}
